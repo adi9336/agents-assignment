@@ -38,6 +38,7 @@ agents that can see, hear, and understand.
 - **Telephony integration**: Works seamlessly with LiveKit's [telephony stack](https://docs.livekit.io/sip/), allowing your agent to make calls to or receive calls from phones.
 - **Exchange data with clients**: Use [RPCs](https://docs.livekit.io/home/client/data/rpc/) and other [Data APIs](https://docs.livekit.io/home/client/data/) to seamlessly exchange data with clients.
 - **Semantic turn detection**: Uses a transformer model to detect when a user is done with their turn, helps to reduce interruptions.
+- **Intelligent interruption handling**: Advanced backchanneling detection to prevent unnecessary interruptions during conversations.
 - **MCP support**: Native support for MCP. Integrate tools provided by MCP servers with one loc.
 - **Builtin test framework**: Write tests and use judges to ensure your agent is performing as expected.
 - **Open-source**: Fully open-source, allowing you to run the entire stack on your own servers, including [LiveKit server](https://github.com/livekit/livekit), one of the most widely used WebRTC media servers.
@@ -213,6 +214,74 @@ async def test_no_availability() -> None:
         )
 
 ```
+
+## Intelligent Interruption Handling
+
+The framework includes advanced interruption logic that intelligently distinguishes between genuine interruptions and conversational backchanneling, ensuring smooth and natural voice interactions.
+
+### How It Works
+
+The interruption system operates in three key stages:
+
+1. **Backchanneling Detection**: When the agent is speaking, the system first checks if the user's input consists solely of backchanneling words (acknowledgments, agreements, etc.)
+2. **Interruption Decision**: If not backchanneling, the system determines whether the input requires interrupting the agent
+3. **Action Execution**: Based on the decision, it either interrupts immediately or processes without interruption
+
+### Backchanneling Words
+
+The system automatically ignores common conversational acknowledgments such as:
+
+- **Basic acknowledgments**: "yeah", "ok", "okay", "hmm", "uh-huh", "mhmm"
+- **Agreement words**: "right", "sure", "gotcha", "yep", "yup", "alright"
+- **Positive feedback**: "good", "great", "excellent", "perfect", "awesome"
+- **Understanding signals**: "i see", "i understand", "makes sense", "got it"
+- **Listening cues**: "go on", "continue", "tell me more", "interesting"
+- **Filler words**: "aha", "mmhmm", "uh-huh", "right"
+
+### Smart Logic Rules
+
+- **Repeated words**: "yeah yeah" or "okay okay" are treated as emphasis (real input), not backchanneling
+- **Command words**: Always trigger interruption (e.g., "stop", "wait", "help")
+- **Mixed content**: If input contains both backchanneling and meaningful content, it's processed as real input
+- **Agent state**: Backchanneling is ignored regardless of whether the agent is speaking or silent
+
+### Audio Behavior
+
+- **No audio breaks**: Agent audio continues uninterrupted during backchanneling verification
+- **Immediate interruption**: Only occurs after confirming genuine user input
+- **Smooth transitions**: Seamless handling between ignoring and interrupting
+
+### Example Scenarios
+
+```
+Agent: "Let me explain the three main benefits of our system..."
+User: "uh-huh, right, okay"
+Result: Agent continues speaking uninterrupted
+
+Agent: "The first benefit is improved efficiency..."
+User: "wait! stop! I have a question"
+Result: Agent stops immediately and listens
+
+Agent: "Any questions about what I've covered?"
+User: "how does this work?"
+Result: Agent processes without interruption (already silent)
+```
+
+### Configuration
+
+The interruption behavior can be customized through:
+
+- **Ignore words list**: Modify which words are considered backchanneling
+- **Command words list**: Define words that always trigger interruption
+- **Thresholds**: Adjust sensitivity for mixed content detection
+- **Agent instructions**: Guide the LLM to ignore backchanneling responses
+
+### Files Involved
+
+- `agent_activity.py`: Core interruption logic in `on_final_transcript()`
+- `interruption_handler.py`: Decision-making logic in `should_interrupt()`
+- `interrupt_config.py`: Word lists and configuration
+- `basic_agent.py`: Agent instructions for LLM behavior
 
 ## Examples
 
