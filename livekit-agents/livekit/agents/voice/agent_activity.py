@@ -1127,6 +1127,9 @@ class AgentActivity(RecognitionHooks):
 
         # self.interrupt() is going to raise when allow_interruptions is False, llm.InputSpeechStartedEvent is only fired by the server when the turn_detection is enabled.  # noqa: E501
         # When using the server-side turn_detection, we don't allow allow_interruptions to be False.
+        if self._interruption_handler.agent_is_speaking:
+            # Defer interruption decision to transcript to filter backchanneling.
+            return
         try:
             self.interrupt()  # input_speech_started is also interrupting on the serverside realtime session  # noqa: E501
         except RuntimeError:
@@ -1144,16 +1147,100 @@ class AgentActivity(RecognitionHooks):
             )
 
     def _on_input_audio_transcription_completed(self, ev: llm.InputTranscriptionCompleted) -> None:
-        self._session._user_input_transcribed(
-            UserInputTranscribedEvent(transcript=ev.transcript, is_final=ev.is_final)
-        )
-
+        # Handle RealtimeModel transcripts with intelligent interruption logic
         if ev.is_final:
-            # TODO: for realtime models, the created_at field is off. it should be set to when the user started speaking.
-            # but we don't have that information here.
+            logger.info(
+                f"🎤 REALTIME TRANSCRIPT: '{ev.transcript}' | "
+                f"Agent speaking: {self._interruption_handler.agent_is_speaking}"
+            )
+            
+            # ===== STEP 1: Check if agent is speaking (for backchanneling detection) =====
+            if self._interruption_handler.agent_is_speaking:
+                logger.info(f"🔊 Agent is speaking - checking for backchanneling...")
+                
+                # Agent is speaking - check if this is backchanneling
+                words = self._interruption_handler.extract_words(ev.transcript)
+                logger.info(f"📝 Extracted words: {words}")
+                
+                if words:
+                    # Check each word against ignore list
+                    word_analysis = []
+                    for word in words:
+                        is_ignored = word in self._interruption_handler.ignore_words
+                        word_analysis.append(f"{word}{'(ignored)' if is_ignored else '(valid)'}")
+                    
+                    logger.info(f"🔍 Word analysis: {' '.join(word_analysis)}")
+                    
+                    # Check if all words are in ignore list (backchanneling)
+                    all_backchanneling = self._interruption_handler.is_pure_backchannel(ev.transcript)
+                    
+                    logger.info(f"🤔 All backchanneling? {all_backchanneling}")
+                    
+                    if all_backchanneling:
+                        # ===== PURE BACKCHANNELING - IGNORE COMPLETELY =====
+                        logger.info(
+                            f"🔇 BACKCHANNELING IGNORED: '{ev.transcript}' - "
+                            f"NOT sending to LLM, NOT interrupting"
+                        )
+                        
+                        # Mark as ignored but don't add to chat context
+                        self._session._user_input_transcribed(
+                            UserInputTranscribedEvent(
+                                transcript=f"[ignored: {ev.transcript}]",
+                                is_final=True,
+                            ),
+                        )
+                        
+                        # ===== STOP HERE - DO NOT PROCESS FURTHER =====
+                        logger.info(f"🚫 PROCESSING STOPPED - Pure backchanneling detected")
+                        return  # This is KEY - prevents adding to LLM context
+            else:
+                logger.info(f"🔇 Agent is silent - normal processing")
+            
+            # ===== STEP 2: Not pure backchanneling - Check interruption logic =====
+            logger.info(f"🧠 Checking interruption logic for: '{ev.transcript}'")
+            should_interrupt = (
+                self._interruption_handler.agent_is_speaking
+                and self._interruption_handler.should_interrupt(ev.transcript)
+            )
+            
+            logger.info(
+                f"⚡ INTERRUPTION DECISION: {should_interrupt} for '{ev.transcript}'"
+            )
+            
+            if should_interrupt:
+                # ===== THIS IS REAL INTERRUPTION - interrupt FIRST =====
+                logger.info(f"🎯 REAL INTERRUPTION: '{ev.transcript}' - Interrupting agent speech")
+                
+                # Run interruption logic IMMEDIATELY before sending to LLM
+                if self._audio_recognition and self._turn_detection not in ("manual", "realtime_llm"):
+                    logger.info(f"🛑 Executing _interrupt_by_audio_activity()")
+                    self._interrupt_by_audio_activity()
+                elif self._rt_session is not None:
+                    self.interrupt()
+
+                logger.info(f"🔄 Creating interrupt_paused_speech task")
+                self._interrupt_paused_speech_task = asyncio.create_task(
+                    self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
+                )
+            else:
+                # ===== NO INTERRUPTION NEEDED - Agent silent or content doesn't require interrupt =====
+                logger.info(f"✅ NO INTERRUPTION: '{ev.transcript}' - Agent silent or content doesn't interrupt")
+            
+            # ===== STEP 3: Send to LLM (only after interruption decision is made) =====
+            logger.info(f"📤 SENDING TO LLM: '{ev.transcript}'")
+            
+            # Add to chat context for RealtimeModel
             msg = llm.ChatMessage(role="user", content=[ev.transcript], id=ev.item_id)
             self._agent._chat_ctx.items.append(msg)
             self._session._conversation_item_added(msg)
+            
+            logger.info(f"✅ PROCESSING COMPLETE for: '{ev.transcript}'")
+        else:
+            # For non-final transcripts, just emit the event
+            self._session._user_input_transcribed(
+                UserInputTranscribedEvent(transcript=ev.transcript, is_final=ev.is_final)
+            )
 
     def _on_generation_created(self, ev: llm.GenerationCreatedEvent) -> None:
         if ev.user_initiated:
@@ -1256,6 +1343,10 @@ class AgentActivity(RecognitionHooks):
             # ignore vad inference done event if turn_detection is manual or realtime_llm
             return
 
+        if self._interruption_handler.agent_is_speaking:
+            # Defer interruption decision to transcript when agent is speaking.
+            return
+
         if ev.speech_duration >= self._session.options.min_interruption_duration:
             self._interrupt_by_audio_activity()
 
@@ -1277,19 +1368,27 @@ class AgentActivity(RecognitionHooks):
             "manual",
             "realtime_llm",
         ):
-            self._interrupt_by_audio_activity()
+            should_interrupt = True
+            if self._interruption_handler.agent_is_speaking:
+                should_interrupt = self._interruption_handler.should_interrupt(
+                    ev.alternatives[0].text
+                )
 
-            if (
-                speaking is False
-                and self._paused_speech
-                and (timeout := self._session.options.false_interruption_timeout) is not None
-            ):
-                # schedule a resume timer if interrupted after end_of_speech
-                self._start_false_interruption_timer(timeout)
+            if should_interrupt:
+                self._interrupt_by_audio_activity()
 
-        self._interrupt_paused_speech_task = asyncio.create_task(
-            self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
-        )
+                if (
+                    speaking is False
+                    and self._paused_speech
+                    and (timeout := self._session.options.false_interruption_timeout)
+                    is not None
+                ):
+                    # schedule a resume timer if interrupted after end_of_speech
+                    self._start_false_interruption_timer(timeout)
+
+                self._interrupt_paused_speech_task = asyncio.create_task(
+                    self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
+                )
 
     def on_final_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None:
         """Process final transcript with intelligent filtering."""
@@ -1300,14 +1399,32 @@ class AgentActivity(RecognitionHooks):
         # Get transcript
         transcript = ev.alternatives[0].text
         
+        logger.info(
+            f"🎤 FINAL TRANSCRIPT RECEIVED: '{transcript}' | "
+            f"Agent speaking: {self._interruption_handler.agent_is_speaking}"
+        )
+        
         # ===== STEP 1: Check if agent is speaking (for backchanneling detection) =====
         if self._interruption_handler.agent_is_speaking:
+            logger.info(f"🔊 Agent is speaking - checking for backchanneling...")
+            
             # Agent is speaking - check if this is backchanneling
-            words = re.findall(r'\b\w+\b', transcript.strip().lower())
+            words = self._interruption_handler.extract_words(transcript)
+            logger.info(f"📝 Extracted words: {words}")
             
             if words:
+                # Check each word against ignore list
+                word_analysis = []
+                for word in words:
+                    is_ignored = word in self._interruption_handler.ignore_words
+                    word_analysis.append(f"{word}{'(ignored)' if is_ignored else '(valid)'}")
+                
+                logger.info(f"🔍 Word analysis: {' '.join(word_analysis)}")
+                
                 # Check if all words are in ignore list (backchanneling)
-                all_backchanneling = all(word in self._interruption_handler.ignore_words for word in words)
+                all_backchanneling = self._interruption_handler.is_pure_backchannel(transcript)
+                
+                logger.info(f"🤔 All backchanneling? {all_backchanneling}")
                 
                 if all_backchanneling:
                     # ===== PURE BACKCHANNELING - IGNORE COMPLETELY =====
@@ -1327,13 +1444,20 @@ class AgentActivity(RecognitionHooks):
                     )
                     
                     # ===== STOP HERE - DO NOT PROCESS FURTHER =====
+                    logger.info(f"🚫 PROCESSING STOPPED - Pure backchanneling detected")
                     return  # This is the KEY - prevents sending to LLM and interruption
+        else:
+            logger.info(f"🔇 Agent is silent - normal processing")
         
         # ===== STEP 2: Not pure backchanneling - Check interruption logic =====
-        should_interrupt = self._interruption_handler.should_interrupt(transcript)
+        logger.info(f"🧠 Checking interruption logic for: '{transcript}'")
+        should_interrupt = (
+            self._interruption_handler.agent_is_speaking
+            and self._interruption_handler.should_interrupt(transcript)
+        )
         
-        logger.debug(
-            f"Should interrupt: {should_interrupt}"
+        logger.info(
+            f"⚡ INTERRUPTION DECISION: {should_interrupt} for '{transcript}'"
         )
         
         if should_interrupt:
@@ -1342,15 +1466,17 @@ class AgentActivity(RecognitionHooks):
             
             # Run interruption logic IMMEDIATELY before sending to LLM
             if self._audio_recognition and self._turn_detection not in ("manual", "realtime_llm"):
+                logger.info(f"🛑 Executing _interrupt_by_audio_activity()")
                 self._interrupt_by_audio_activity()
-
                 if (
                     speaking is False
                     and self._paused_speech
                     and (timeout := self._session.options.false_interruption_timeout) is not None
                 ):
+                    logger.info(f"⏰ Starting false interruption timer: {timeout}s")
                     self._start_false_interruption_timer(timeout)
 
+            logger.info(f"🔄 Creating interrupt_paused_speech task")
             self._interrupt_paused_speech_task = asyncio.create_task(
                 self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
             )
@@ -1359,6 +1485,7 @@ class AgentActivity(RecognitionHooks):
             logger.info(f"✅ NO INTERRUPTION: '{transcript}' - Agent silent or content doesn't interrupt")
         
         # ===== STEP 3: Send to LLM (only after interruption decision is made) =====
+        logger.info(f"📤 SENDING TO LLM: '{transcript}'")
         
         # Emit transcription event (this goes to LLM)
         self._session._user_input_transcribed(
@@ -1370,7 +1497,7 @@ class AgentActivity(RecognitionHooks):
             ),
         )
         
-        logger.info(f"📤 SENDING TO LLM: '{transcript}'")
+        logger.info(f"✅ PROCESSING COMPLETE for: '{transcript}'")
 
     def on_preemptive_generation(self, info: _PreemptiveGenerationInfo) -> None:
         if (
@@ -2674,3 +2801,4 @@ class AgentActivity(RecognitionHooks):
     @property
     def tts(self) -> tts.TTS | None:
         return self._agent.tts if is_given(self._agent.tts) else self._session.tts
+
